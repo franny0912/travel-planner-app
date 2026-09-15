@@ -1,0 +1,478 @@
+<script>
+  // ====== google.script.run → Promise ======
+  function call(name) {
+    var args = Array.prototype.slice.call(arguments, 1)
+    return new Promise(function (resolve, reject) {
+      google.script.run
+        .withSuccessHandler(resolve)
+        .withFailureHandler(reject)[name].apply(null, args)
+    })
+  }
+
+  // ====== 狀態 ======
+  var S = { config: { aiConfigured: false }, trip: null, member: null, members: [], tab: 'time' }
+  var view = document.getElementById('view')
+  document.getElementById('brand').onclick = function () {
+    S.trip = null; S.member = null; renderHome()
+  }
+
+  // ====== 小工具 ======
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+    })
+  }
+  function ymd(d) {
+    var y = d.getFullYear(), m = ('0' + (d.getMonth() + 1)).slice(-2), day = ('0' + d.getDate()).slice(-2)
+    return y + '-' + m + '-' + day
+  }
+  var WEEKDAY = ['日', '一', '二', '三', '四', '五', '六']
+  function fmtDate(s) { var d = new Date(s); return (d.getMonth() + 1) + '/' + d.getDate() + '（' + WEEKDAY[d.getDay()] + '）' }
+
+  // 記住這台裝置在某揪團裡是誰
+  function getSess(id) { try { return (JSON.parse(localStorage.getItem('tp_sess') || '{}'))[id] || null } catch (e) { return null } }
+  function setSess(id, m) { try { var a = JSON.parse(localStorage.getItem('tp_sess') || '{}'); a[id] = { memberId: m.id, nickname: m.nickname }; localStorage.setItem('tp_sess', JSON.stringify(a)) } catch (e) {} }
+  function clearSess(id) { try { var a = JSON.parse(localStorage.getItem('tp_sess') || '{}'); delete a[id]; localStorage.setItem('tp_sess', JSON.stringify(a)) } catch (e) {} }
+
+  // ====== 彙整計算 ======
+  function rankDates(availability, members) {
+    var byDate = {}
+    availability.forEach(function (a) { (byDate[a.date] = byDate[a.date] || {})[a.member_id] = 1 })
+    var nameOf = {}; members.forEach(function (m) { nameOf[m.id] = m.nickname })
+    var rows = Object.keys(byDate).map(function (date) {
+      var ids = Object.keys(byDate[date])
+      return { date: date, count: ids.length, members: ids.map(function (id) { return nameOf[id] }).filter(Boolean) }
+    })
+    rows.sort(function (a, b) { return b.count - a.count || a.date.localeCompare(b.date) })
+    return rows
+  }
+  function bestWindow(ranked) {
+    if (!ranked.length) return null
+    var maxCount = ranked[0].count
+    var top = ranked.filter(function (d) { return d.count === maxCount }).map(function (d) { return d.date }).sort()
+    var start = top[0], end = top[0]
+    for (var i = 1; i < top.length; i++) {
+      if ((new Date(top[i]) - new Date(top[i - 1])) / 86400000 === 1) end = top[i]; else break
+    }
+    return { start: start, end: end, count: maxCount }
+  }
+  function rankDestinations(preferences, destinations) {
+    var byMember = {}
+    preferences.forEach(function (p) { (byMember[p.member_id] = byMember[p.member_id] || []).push(p) })
+    var score = {}, votes = {}, rankSum = {}
+    Object.keys(byMember).forEach(function (mid) {
+      var list = byMember[mid], n = list.length
+      list.forEach(function (p) {
+        var r = Number(p.rank)
+        score[p.destination_id] = (score[p.destination_id] || 0) + (n - r + 1)
+        votes[p.destination_id] = (votes[p.destination_id] || 0) + 1
+        rankSum[p.destination_id] = (rankSum[p.destination_id] || 0) + r
+      })
+    })
+    var rows = destinations.map(function (d) {
+      var v = votes[d.id] || 0
+      return { id: d.id, name: d.name, score: score[d.id] || 0, votes: v, avgRank: v ? rankSum[d.id] / v : null }
+    })
+    rows.sort(function (a, b) { return b.score - a.score || b.votes - a.votes })
+    return rows
+  }
+  function summarizeWeather(days) {
+    var valid = (days || []).filter(function (d) { return d.tmax != null && d.tmin != null })
+    if (!valid.length) return null
+    var avgMax = valid.reduce(function (s, d) { return s + Number(d.tmax) }, 0) / valid.length
+    var avgMin = valid.reduce(function (s, d) { return s + Number(d.tmin) }, 0) / valid.length
+    var rainDays = valid.filter(function (d) { return Number(d.precip || 0) >= 1 }).length
+    return { avgMax: Math.round(avgMax), avgMin: Math.round(avgMin), rainDays: rainDays, total: valid.length }
+  }
+
+  // ====== 首頁 ======
+  function renderHome() {
+    view.innerHTML =
+      '<section class="card"><h1>和朋友一起規劃旅遊 🗺️</h1>' +
+      '<p class="muted">大家各自填「有空的時間」和「想去的國家＋志願序」，系統幫你們彙整重疊時段、熱門目的地，再附上天氣與 AI 建議。</p></section>' +
+      '<div class="card">' +
+      '<div class="tabs"><button class="tab active" id="tCreate">建立新揪團</button><button class="tab" id="tJoin">用邀請碼加入</button></div>' +
+      '<div id="homeForm"></div><p class="error" id="homeErr"></p></div>'
+    var mode = 'create'
+    function draw() {
+      document.getElementById('tCreate').className = mode === 'create' ? 'tab active' : 'tab'
+      document.getElementById('tJoin').className = mode === 'join' ? 'tab active' : 'tab'
+      var f = document.getElementById('homeForm')
+      if (mode === 'create') {
+        f.innerHTML = '<div class="form"><label>揪團名稱<input id="tripName" placeholder="例如：2026 春天的日本行" /></label>' +
+          '<button class="btn primary" id="doCreate">建立並取得邀請碼</button></div>'
+        document.getElementById('doCreate').onclick = doCreate
+      } else {
+        f.innerHTML = '<div class="form"><label>邀請碼<input id="code" maxlength="6" placeholder="6 碼，例如 K7M2QP" /></label>' +
+          '<button class="btn primary" id="doJoin">前往揪團</button></div>'
+        document.getElementById('doJoin').onclick = doJoin
+      }
+    }
+    document.getElementById('tCreate').onclick = function () { mode = 'create'; draw() }
+    document.getElementById('tJoin').onclick = function () { mode = 'join'; draw() }
+    draw()
+
+    function doCreate() {
+      var name = (document.getElementById('tripName').value || '').trim()
+      if (!name) return
+      var btn = document.getElementById('doCreate'); btn.disabled = true; btn.textContent = '建立中…'
+      call('apiCreateTrip', name).then(function (trip) {
+        S.trip = trip; openTrip()
+      }).catch(function (e) { showErr('建立失敗：' + e.message); btn.disabled = false; btn.textContent = '建立並取得邀請碼' })
+    }
+    function doJoin() {
+      var code = (document.getElementById('code').value || '').trim().toUpperCase()
+      if (!code) return
+      var btn = document.getElementById('doJoin'); btn.disabled = true; btn.textContent = '查詢中…'
+      call('apiGetTripByCode', code).then(function (trip) {
+        if (!trip) { showErr('找不到這個邀請碼，請確認是否輸入正確。'); btn.disabled = false; btn.textContent = '前往揪團'; return }
+        S.trip = trip; openTrip()
+      }).catch(function (e) { showErr('加入失敗：' + e.message); btn.disabled = false; btn.textContent = '前往揪團' })
+    }
+    function showErr(m) { document.getElementById('homeErr').textContent = m }
+  }
+
+  // ====== 進入揪團（載入成員 + 判斷身分） ======
+  function openTrip() {
+    view.innerHTML = '<p class="muted">載入中…</p>'
+    call('apiListMembers', S.trip.id).then(function (members) {
+      S.members = members
+      var saved = getSess(S.trip.id)
+      if (saved) { S.member = { id: saved.memberId, nickname: saved.nickname }; renderTrip() }
+      else renderJoin()
+    })
+  }
+
+  function renderJoin() {
+    view.innerHTML =
+      '<div class="card narrow"><h2>' + esc(S.trip.name) + '</h2>' +
+      '<p class="muted">先告訴大家你是誰，就能開始填囉。</p>' +
+      '<div class="form"><label>你的暱稱<input id="nick" placeholder="例如：小明" /></label>' +
+      '<button class="btn primary" id="doJoinTrip">進入揪團</button></div>' +
+      (S.members.length ? '<p class="muted small">已加入：' + esc(S.members.map(function (m) { return m.nickname }).join('、')) + '</p>' : '') +
+      '</div>'
+    document.getElementById('doJoinTrip').onclick = function () {
+      var name = (document.getElementById('nick').value || '').trim()
+      if (!name) return
+      var btn = this; btn.disabled = true
+      call('apiJoinTrip', S.trip.id, name).then(function (m) {
+        S.member = m; setSess(S.trip.id, m); openTrip()
+      }).catch(function (e) { btn.disabled = false; alert('加入失敗：' + e.message) })
+    }
+  }
+
+  function renderTrip() {
+    var base = (S.config && S.config.webAppUrl) || window.location.href.split('?')[0]
+    var shareUrl = base + '?code=' + S.trip.code
+    view.innerHTML =
+      '<div class="trip-header"><div><h2>' + esc(S.trip.name) + '</h2>' +
+      '<p class="muted small">你是 <strong>' + esc(S.member.nickname) + '</strong>　·　成員（' + S.members.length + '）：' +
+      esc(S.members.map(function (m) { return m.nickname }).join('、')) +
+      '　·　<button class="linklike" id="switchMe">切換身分</button></p></div>' +
+      '<div class="invite"><span class="muted small">邀請碼</span><code class="code-chip">' + esc(S.trip.code) + '</code>' +
+      '<button class="btn ghost small" id="copyInvite">複製邀請連結</button></div></div>' +
+      '<nav class="tabs">' +
+      '<button class="tab" data-tab="time">🗓️ 我的時段</button>' +
+      '<button class="tab" data-tab="dest">🌍 目的地與志願序</button>' +
+      '<button class="tab" data-tab="summary">📊 彙整看板</button></nav>' +
+      '<div class="tab-panel" id="panel"></div>'
+    document.getElementById('switchMe').onclick = function () { clearSess(S.trip.id); S.member = null; renderJoin() }
+    document.getElementById('copyInvite').onclick = function () {
+      var btn = this
+      try { navigator.clipboard.writeText(shareUrl).then(function () { btn.textContent = '已複製 ✓'; setTimeout(function () { btn.textContent = '複製邀請連結' }, 1500) }) }
+      catch (e) { prompt('複製這個連結分享給朋友：', shareUrl) }
+    }
+    var tabs = view.querySelectorAll('.tab')
+    tabs.forEach(function (t) {
+      t.onclick = function () { S.tab = t.getAttribute('data-tab'); drawTabs() }
+    })
+    function drawTabs() {
+      tabs.forEach(function (t) { t.className = t.getAttribute('data-tab') === S.tab ? 'tab active' : 'tab' })
+      if (S.tab === 'time') renderAvailability()
+      else if (S.tab === 'dest') renderDestinations()
+      else renderSummary()
+    }
+    drawTabs()
+  }
+
+  // ====== 我的時段 ======
+  function renderAvailability() {
+    var panel = document.getElementById('panel')
+    panel.innerHTML = '<p class="muted">載入中…</p>'
+    var A = { cursor: new Date(), mine: {}, all: [], memberCount: 1, timer: null }
+    A.cursor = new Date(A.cursor.getFullYear(), A.cursor.getMonth(), 1)
+    Promise.all([call('apiListAvailability', S.trip.id), call('apiListMembers', S.trip.id)]).then(function (r) {
+      A.all = r[0]; A.memberCount = Math.max(r[1].length, 1)
+      r[0].forEach(function (a) { if (a.member_id === S.member.id) A.mine[a.date] = 1 })
+      draw()
+    })
+    function heat() {
+      var map = {}
+      A.all.forEach(function (a) { (map[a.date] = map[a.date] || {})[a.member_id] = 1 })
+      Object.keys(map).forEach(function (d) { if (map[d][S.member.id] && !A.mine[d]) delete map[d][S.member.id] })
+      Object.keys(A.mine).forEach(function (d) { (map[d] = map[d] || {})[S.member.id] = 1 })
+      return map
+    }
+    function draw() {
+      var today = new Date(ymd(new Date()))
+      var y = A.cursor.getFullYear(), mo = A.cursor.getMonth()
+      var startPad = new Date(y, mo, 1).getDay()
+      var days = new Date(y, mo + 1, 0).getDate()
+      var h = heat()
+      var html = '<p class="muted">點一下日期＝我這天有空。可跨月填寫、會自動儲存。格子數字＝目前有幾人這天有空。</p>' +
+        '<div class="cal-toolbar"><button class="btn ghost small" id="prevM">‹ 上個月</button>' +
+        '<strong>' + y + ' 年 ' + (mo + 1) + ' 月</strong>' +
+        '<button class="btn ghost small" id="nextM">下個月 ›</button><span class="save-status" id="saveStat"></span></div>' +
+        '<div class="calendar">'
+      WEEKDAY.forEach(function (w) { html += '<div class="cal-weekday">' + w + '</div>' })
+      for (var i = 0; i < startPad; i++) html += '<div class="cal-cell empty"></div>'
+      for (var d = 1; d <= days; d++) {
+        var cell = new Date(y, mo, d), ds = ymd(cell)
+        var isPast = cell < today, sel = !!A.mine[ds]
+        var count = h[ds] ? Object.keys(h[ds]).length : 0
+        html += '<button class="cal-cell' + (sel ? ' selected' : '') + (isPast ? ' past' : '') + '" data-d="' + ds + '"' + (isPast ? ' disabled' : '') + ' title="' + count + ' 人有空 / 共 ' + A.memberCount + ' 人">' +
+          '<span>' + d + '</span>' + (count > 0 ? '<span class="cal-count">' + count + '</span>' : '') + '</button>'
+      }
+      html += '</div>'
+      panel.innerHTML = html
+      document.getElementById('prevM').onclick = function () { A.cursor = new Date(y, mo - 1, 1); draw() }
+      document.getElementById('nextM').onclick = function () { A.cursor = new Date(y, mo + 1, 1); draw() }
+      panel.querySelectorAll('.cal-cell[data-d]').forEach(function (b) {
+        b.onclick = function () {
+          var ds = b.getAttribute('data-d')
+          if (A.mine[ds]) delete A.mine[ds]; else A.mine[ds] = 1
+          save(); draw()
+        }
+      })
+    }
+    function save() {
+      var stat = document.getElementById('saveStat'); if (stat) stat.textContent = '儲存中…'
+      if (A.timer) clearTimeout(A.timer)
+      A.timer = setTimeout(function () {
+        call('apiSetAvailability', S.trip.id, S.member.id, Object.keys(A.mine)).then(function () {
+          return call('apiListAvailability', S.trip.id)
+        }).then(function (all) {
+          A.all = all
+          var s = document.getElementById('saveStat'); if (s) { s.textContent = '已儲存 ✓'; setTimeout(function () { if (s) s.textContent = '' }, 1200) }
+        })
+      }, 600)
+    }
+  }
+
+  // ====== 目的地與志願序 ======
+  function renderDestinations() {
+    var panel = document.getElementById('panel')
+    panel.innerHTML = '<p class="muted">載入中…</p>'
+    var D = { dests: [], order: [] }
+    function load() {
+      return Promise.all([call('apiListDestinations', S.trip.id), call('apiListPreferences', S.trip.id)]).then(function (r) {
+        D.dests = r[0]
+        D.order = r[1].filter(function (p) { return p.member_id === S.member.id })
+          .sort(function (a, b) { return Number(a.rank) - Number(b.rank) })
+          .map(function (p) { return p.destination_id })
+          .filter(function (id) { return D.dests.some(function (d) { return d.id === id }) })
+        draw()
+      })
+    }
+    load()
+    function nameOf(id) { var d = D.dests.filter(function (x) { return x.id === id })[0]; return d ? d.name : '（已刪除）' }
+    function saveOrder(order) {
+      D.order = order
+      var s = document.getElementById('prefStat'); if (s) s.textContent = '儲存中…'
+      return call('apiSetPreferences', S.trip.id, S.member.id, order).then(function () {
+        var s2 = document.getElementById('prefStat'); if (s2) { s2.textContent = '已儲存 ✓'; setTimeout(function () { if (s2) s2.textContent = '' }, 1200) }
+        draw()
+      })
+    }
+    function draw() {
+      var notRanked = D.dests.filter(function (d) { return D.order.indexOf(d.id) < 0 })
+      var html = '<div class="dest-layout"><section class="card"><h3>想去的地方（大家共用）</h3>' +
+        '<div class="row-form"><input id="newDest" placeholder="輸入國家或城市，例如：日本 京都" /><button class="btn primary small" id="addDest">新增</button></div>'
+      if (!D.dests.length) html += '<p class="muted small">還沒有人提議地點，先新增一個吧。</p>'
+      else {
+        html += '<ul class="dest-list">'
+        D.dests.forEach(function (d) {
+          html += '<li><span class="name">' + esc(d.name) + '</span><span class="muted small">由 ' + esc(d.created_by) + ' 提議</span>' +
+            '<button class="linklike danger" data-del="' + d.id + '">刪除</button></li>'
+        })
+        html += '</ul>'
+      }
+      html += '</section><section class="card"><h3>我的志願序 <span class="save-status" id="prefStat"></span></h3>' +
+        '<p class="muted small">把想去的加進來，再用箭頭調整順序（第 1 名 = 最想去）。</p>'
+      if (!D.order.length) html += '<p class="muted small">尚未排志願序。</p>'
+      else {
+        html += '<ol class="rank-list">'
+        D.order.forEach(function (id, idx) {
+          html += '<li><span class="rank-num">' + (idx + 1) + '</span><span class="rank-name">' + esc(nameOf(id)) + '</span>' +
+            '<span><button class="btn ghost tiny" data-up="' + idx + '"' + (idx === 0 ? ' disabled' : '') + '>↑</button> ' +
+            '<button class="btn ghost tiny" data-down="' + idx + '"' + (idx === D.order.length - 1 ? ' disabled' : '') + '>↓</button> ' +
+            '<button class="linklike danger" data-remove="' + id + '">移除</button></span></li>'
+        })
+        html += '</ol>'
+      }
+      if (notRanked.length) {
+        html += '<p class="muted small">尚未加入我的志願：</p><div class="chips">'
+        notRanked.forEach(function (d) { html += '<button class="chip" data-add="' + d.id + '">+ ' + esc(d.name) + '</button>' })
+        html += '</div>'
+      }
+      html += '</section></div>'
+      panel.innerHTML = html
+
+      document.getElementById('addDest').onclick = function () {
+        var v = (document.getElementById('newDest').value || '').trim()
+        if (!v) return
+        call('apiAddDestination', S.trip.id, v, S.member.nickname).then(load)
+      }
+      panel.querySelectorAll('[data-del]').forEach(function (b) {
+        b.onclick = function () {
+          var id = b.getAttribute('data-del')
+          call('apiRemoveDestination', id).then(function () { saveOrder(D.order.filter(function (x) { return x !== id })).then(load) })
+        }
+      })
+      panel.querySelectorAll('[data-add]').forEach(function (b) { b.onclick = function () { saveOrder(D.order.concat([b.getAttribute('data-add')])) } })
+      panel.querySelectorAll('[data-remove]').forEach(function (b) { b.onclick = function () { var id = b.getAttribute('data-remove'); saveOrder(D.order.filter(function (x) { return x !== id })) } })
+      panel.querySelectorAll('[data-up]').forEach(function (b) { b.onclick = function () { move(Number(b.getAttribute('data-up')), -1) } })
+      panel.querySelectorAll('[data-down]').forEach(function (b) { b.onclick = function () { move(Number(b.getAttribute('data-down')), 1) } })
+    }
+    function move(idx, delta) {
+      var j = idx + delta; if (j < 0 || j >= D.order.length) return
+      var next = D.order.slice(); var tmp = next[idx]; next[idx] = next[j]; next[j] = tmp; saveOrder(next)
+    }
+  }
+
+  // ====== 彙整看板 ======
+  function renderSummary() {
+    var panel = document.getElementById('panel')
+    panel.innerHTML = '<p class="muted">載入中…</p>'
+    var weatherCache = {}
+    Promise.all([
+      call('apiListAvailability', S.trip.id),
+      call('apiListDestinations', S.trip.id),
+      call('apiListPreferences', S.trip.id),
+      call('apiListMembers', S.trip.id),
+    ]).then(function (r) {
+      var availability = r[0], destinations = r[1], preferences = r[2]; S.members = r[3]
+      var dates = rankDates(availability, S.members)
+      var win = bestWindow(dates)
+      var dests = rankDestinations(preferences, destinations)
+      var topDests = dests.filter(function (d) { return d.votes > 0 }).slice(0, 3)
+      var noData = dates.length === 0 && dests.every(function (d) { return d.votes === 0 })
+      if (noData) {
+        panel.innerHTML = '<p class="muted">還沒有足夠的資料。請大家先到「我的時段」勾選有空日期、到「目的地與志願序」排一下順序，這裡就會出現彙整結果。</p>'
+        return
+      }
+      draw()
+
+      function draw() {
+        var html = ''
+        // 時段
+        html += '<section class="card"><h3>🗓️ 大家最有空的日期</h3>'
+        if (!dates.length) html += '<p class="muted small">還沒有人勾選時段。</p>'
+        else {
+          html += '<ul class="rank-bars">'
+          dates.slice(0, 8).forEach(function (d) {
+            html += '<li><span class="bar-label">' + fmtDate(d.date) + '</span><span class="bar-track"><span class="bar-fill" style="width:' +
+              (d.count / Math.max(S.members.length, 1) * 100) + '%"></span></span><span class="bar-value" title="' + esc(d.members.join('、')) + '">' +
+              d.count + '/' + S.members.length + ' 人</span></li>'
+          })
+          html += '</ul>'
+        }
+        if (win) html += '<p class="muted small">建議區間：<strong>' + fmtDate(win.start) + '</strong>' +
+          (win.end !== win.start ? ' ～ <strong>' + fmtDate(win.end) + '</strong>' : '') + '（' + win.count + ' 人皆有空）</p>'
+        html += '</section>'
+        // 目的地
+        html += '<section class="card"><h3>🌍 最想去的地方（依志願序加權）</h3>'
+        if (!topDests.length) html += '<p class="muted small">還沒有人排志願序。</p>'
+        else {
+          html += '<table class="rank-table"><thead><tr><th>#</th><th>地點</th><th>加權分</th><th>投票數</th><th>平均志願</th><th>機票</th></tr></thead><tbody>'
+          dests.filter(function (d) { return d.votes > 0 }).forEach(function (d, i) {
+            var fl = 'https://www.google.com/travel/flights?q=' + encodeURIComponent('flights to ' + d.name)
+            html += '<tr><td>' + (i + 1) + '</td><td>' + esc(d.name) + '</td><td>' + d.score + '</td><td>' + d.votes + '</td><td>' +
+              (d.avgRank ? d.avgRank.toFixed(1) : '—') + '</td><td><a class="linklike" target="_blank" href="' + fl + '">查機票 ↗</a></td></tr>'
+          })
+          html += '</tbody></table>'
+        }
+        html += '</section>'
+        // 天氣
+        html += '<section class="card"><div class="card-head"><h3>🌤️ 熱門目的地天氣</h3>' +
+          '<button class="btn ghost small" id="loadW"' + (!win || !topDests.length ? ' disabled' : '') + '>查詢天氣</button></div>'
+        if (!win) html += '<p class="muted small">先有重疊時段才能查對應天氣。</p>'
+        html += '<div id="weatherBox"><p class="muted small">按「查詢天氣」載入前三名目的地在建議區間的天氣。</p></div></section>'
+        // AI
+        html += '<section class="card"><div class="card-head"><h3>🤖 AI 彙整建議</h3>' +
+          '<button class="btn primary small" id="askAi">產生 AI 建議</button></div>'
+        if (!S.config.aiConfigured) html += '<p class="muted small">AI 尚未設定：請在 Apps Script 的「專案設定 → 指令碼屬性」新增 ANTHROPIC_API_KEY。未設定時其他功能仍可正常使用。</p>'
+        html += '<div id="aiBox"></div></section>'
+        panel.innerHTML = html
+
+        var loadW = document.getElementById('loadW')
+        if (loadW) loadW.onclick = function () {
+          loadW.disabled = true; loadW.textContent = '查詢中…'
+          var box = document.getElementById('weatherBox'); box.innerHTML = '<p class="muted small">查詢中…</p>'
+          var jobs = topDests.map(function (d) { return call('apiGetWeather', d.name, win.start, win.end).then(function (w) { weatherCache[d.name] = w }) })
+          Promise.all(jobs).then(function () {
+            var wh = '<div class="weather-grid">'
+            topDests.forEach(function (d) {
+              var w = weatherCache[d.name]; if (!w) return
+              wh += '<div class="weather-card"><strong>' + esc(d.name) + '</strong>'
+              if (w.error) wh += '<p class="muted small">' + esc(w.error) + '</p>'
+              else {
+                var s = summarizeWeather(w.days)
+                wh += '<p class="muted small">' + esc(w.place ? w.place.label : '') + '</p>'
+                if (s) wh += '<p class="weather-temp">' + s.avgMin + '° ~ ' + s.avgMax + '°C</p>' +
+                  '<p class="muted small">' + s.total + ' 天中約 ' + s.rainDays + ' 天有雨</p>' +
+                  '<p class="muted small">' + (w.source === 'forecast' ? '（實際預報）' : '（去年同期參考）') + '</p>'
+                else wh += '<p class="muted small">無資料</p>'
+              }
+              wh += '</div>'
+            })
+            wh += '</div>'
+            box.innerHTML = wh
+            loadW.disabled = false; loadW.textContent = '重新查詢'
+          })
+        }
+        document.getElementById('askAi').onclick = function () {
+          var btn = this; btn.disabled = true; btn.textContent = '思考中…'
+          var aiBox = document.getElementById('aiBox'); aiBox.innerHTML = '<p class="muted small">AI 思考中…</p>'
+          var weather = {}
+          Object.keys(weatherCache).forEach(function (k) { weather[k] = summarizeWeather(weatherCache[k].days) })
+          var payload = {
+            tripName: S.trip.name, memberCount: S.members.length,
+            members: S.members.map(function (m) { return m.nickname }),
+            topDates: dates.slice(0, 5).map(function (d) { return { date: d.date, count: d.count, who: d.members } }),
+            bestWindow: win,
+            topDestinations: dests.slice(0, 6).map(function (d) { return { name: d.name, score: d.score, votes: d.votes, avgRank: d.avgRank } }),
+            weather: weather,
+          }
+          call('apiGetAiSuggestion', payload).then(function (res) {
+            btn.disabled = false; btn.textContent = '重新產生'
+            if (res.error) aiBox.innerHTML = '<p class="error">' + esc(res.error) + '</p>'
+            else aiBox.innerHTML = '<div class="ai-output">' + esc(res.text) + '</div>'
+          }).catch(function (e) {
+            btn.disabled = false; btn.textContent = '產生 AI 建議'
+            aiBox.innerHTML = '<p class="error">' + esc(e.message) + '</p>'
+          })
+        }
+      }
+    })
+  }
+
+  // ====== 啟動 ======
+  function boot() {
+    // 先取得設定（含 web app 網址、AI 是否啟用），再渲染畫面
+    call('apiGetConfig').then(function (cfg) {
+      S.config = cfg || {}
+      if (google.script.url && google.script.url.getLocation) {
+        google.script.url.getLocation(function (loc) {
+          var code = loc && loc.parameter && loc.parameter.code
+          if (code) {
+            call('apiGetTripByCode', String(code).toUpperCase()).then(function (trip) {
+              if (trip) { S.trip = trip; openTrip() } else renderHome()
+            }).catch(renderHome)
+          } else renderHome()
+        })
+      } else renderHome()
+    }).catch(function () { renderHome() })
+  }
+  boot()
+</script>

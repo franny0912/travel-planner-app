@@ -15,6 +15,9 @@
 - 🤖 **AI 建議**：Claude 綜合時間／票數／天氣，推薦目的地與行程方向
 - 🎫 機票：先以「自己查」連結佔位（不爬 Skyscanner，改用合法方式，日後再串 API）
 
+> 💡 **不想碰 Vercel / Supabase？** 另有一份 **Google Apps Script 版**（資料存你自己的
+> Google 試算表，部署成網頁 App 即可分享），見 [`apps-script/`](apps-script/README.md)。
+
 ## 技術架構
 
 - 前端：**React + Vite**（純前端，可部署為靜態網站）
