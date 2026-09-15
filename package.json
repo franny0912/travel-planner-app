@@ -1,0 +1,22 @@
+{
+  "name": "travel-planner-app",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "和朋友一起規劃旅遊：收集大家有空的時間與想去的國家，彙整重疊時段、熱門目的地、天氣與 AI 建議。",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.4",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.26.2"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.1",
+    "vite": "^5.4.8"
+  }
+}
